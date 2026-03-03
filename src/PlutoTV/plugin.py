@@ -65,7 +65,7 @@ from os import makedirs, statvfs
 from os.path import exists, getsize, isdir, isfile, join
 from pickle import dump, load
 from re import sub
-from requests import get
+from requests import get, Session
 from shutil import copy2
 from time import gmtime, localtime, sleep, strftime, strptime, time
 from traceback import format_exc
@@ -124,6 +124,112 @@ PLUTO_SERVICE_NUMBER_PATH = "/etc/enigma2/PlutoTV_numbers"
 
 SID1_HEX = str(uuid4().hex)  # Defined as a global to save time.
 DEVICEID1_HEX = str(uuid1().hex)  # Defined as a global to save time.
+
+
+class PlutoAuth:
+	BOOT_URL = "https://boot.pluto.tv/v4/start"
+	STITCHER_BASE = "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv"
+
+	def __init__(self):
+		self.session = Session()
+		self.client_id = str(uuid4())
+		self.cache = {}
+
+	@staticmethod
+	def _tokenExpiry(token):
+		try:
+			from json import loads
+			from base64 import urlsafe_b64decode
+			payload = token.split(".")[1]
+			padding = 4 - len(payload) % 4
+			if padding != 4:
+				payload += "=" * padding
+			return loads(urlsafe_b64decode(payload)).get("exp", 0)
+		except Exception:
+			return 0
+
+	def boot(self, ipAddress=""):
+		cacheKey = ipAddress or "default"
+		cached = self.cache.get(cacheKey)
+		if cached and time() < cached["exp"] - 60:
+			return cached["response"]
+		headers = {
+			"authority": "boot.pluto.tv",
+			"accept": "*/*",
+			"accept-language": "en-US,en;q=0.9",
+			"origin": "https://pluto.tv",
+			"referer": "https://pluto.tv/",
+			"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+			"sec-ch-ua-mobile": "?0",
+			"sec-ch-ua-platform": '"Linux"',
+			"sec-fetch-dest": "empty",
+			"sec-fetch-mode": "cors",
+			"sec-fetch-site": "same-site",
+			"user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		}
+		params = {
+			"appName": "web",
+			"appVersion": "8.0.0-111b2b9dc00bd0bea9030b30662159ed9e7c8bc6",
+			"deviceVersion": "122.0.0",
+			"deviceModel": "web",
+			"deviceMake": "chrome",
+			"deviceType": "web",
+			"clientID": self.client_id,
+			"clientModelNumber": "1.0.0",
+			"serverSideAds": "false",
+			"drmCapabilities": "widevine:L3",
+			"blockingMode": "",
+		}
+		if ipAddress:
+			headers["X-Forwarded-For"] = ipAddress
+		try:
+			response = self.session.get(self.BOOT_URL, headers=headers, params=params, timeout=10)
+			response.raise_for_status()
+			resp = response.json()
+			token = resp.get("sessionToken", "")
+			exp = self._tokenExpiry(token)
+			self.cache[cacheKey] = {"response": resp, "exp": exp}
+			print(f"[PlutoTV] New token for {cacheKey}, expires {exp}")
+			return resp
+		except Exception as e:
+			print(f"[PlutoTV] boot error: {e}")
+			return {}
+
+	def _apiHeaders(self, ipAddress=""):
+		token = self.boot(ipAddress).get("sessionToken", "")
+		headers = {
+			"accept": "application/json, text/javascript, */*; q=0.01",
+			"authorization": f"Bearer {token}",
+			"origin": "https://pluto.tv",
+			"referer": "https://pluto.tv/",
+			"user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		}
+		if ipAddress:
+			headers["X-Forwarded-For"] = ipAddress
+		return headers
+
+	def buildStreamURL(self, channel_id, ipAddress=""):
+		boot_resp = self.boot(ipAddress)
+		token = boot_resp.get("sessionToken", "")
+		return (
+			f"{self.STITCHER_BASE}/v2/stitch/hls/channel/{channel_id}/master.m3u8"
+			f"?jwt={token}&masterJWTPassthrough=true"
+		)
+
+	def buildVodStreamURL(self, vod_url, ipAddress=""):
+		boot_resp = self.boot(ipAddress)
+		token = boot_resp.get("sessionToken", "")
+		path = vod_url.split("?")[0]
+		path = sub(r"^https?://[^/]+", "", path)
+		if path.startswith("/stitch/"):
+			path = "/v2" + path
+		return (
+			f"{self.STITCHER_BASE}{path}"
+			f"?jwt={token}&masterJWTPassthrough=true"
+		)
+
+
+plutoAuth = PlutoAuth()
 
 PLUTO_COUNTRY_NAME = 0
 PLUTO_IP = 1
