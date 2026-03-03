@@ -71,7 +71,7 @@ from time import gmtime, localtime, sleep, strftime, strptime, time
 from traceback import format_exc
 from twisted.internet import defer, reactor, threads
 from unicodedata import normalize
-from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from uuid import uuid4, uuid1
 
 from enigma import eDVBDB, eEPGCache, ePicLoad, eServiceCenter, eServiceReference, eTimer, gRGB, iPlayableService
@@ -580,12 +580,10 @@ class PlutoTV(Screen):
 			self.favorites[self.region] = {}
 		self.categories[self.FAVORITES_NAME] = [self.favorites[self.region][x] for x in self.favorites[self.region].keys()]  # It is assumed that the favorites category item is *always* first!
 		self.categoryMenu.append((self.FAVORITES_NAME, self.FAVORITES_NAME, len(self.favorites[self.region])))  # It is assumed that the favorites menu item is *always* first!
-		header = buildHeader(PLUTO_DATA[self.region][PLUTO_IP])
+		header = plutoAuth._apiHeaders(PLUTO_DATA[self.region][PLUTO_IP])
 		param = {
 			"includeItems": "true",
 			"deviceType": "web",
-			"deviceId": DEVICEID1_HEX,
-			"sid": SID1_HEX,
 		}
 		carousel = fetchURL(PLUTO_VOD_URL, header=header, param=param)  # A single dictionary.
 		# carouselDump(self.region, carousel)
@@ -929,14 +927,7 @@ class PlutoTV(Screen):
 
 	def keySelect(self):
 		def playVOD(url, name, identifier):
-			url = updateQuery(url, {
-				"deviceId": DEVICEID1_HEX,
-				"sid": DEVICEID1_HEX,
-				"deviceType": "web",
-				"deviceMake": "Firefox",
-				"deviceModel": "Firefox",
-				"appName": "web"
-			})
+			url = plutoAuth.buildVodStreamURL(url, PLUTO_DATA[self.region][PLUTO_IP])
 			serviceReference = eServiceReference(f"4097:0:0:0:0:0:0:0:0:0:{url.replace(":", "%3A")}:{name.replace(":", "%3A")}")
 			if "m3u8" in url.lower():
 				self.session.open(PlutoPlayer, serviceReference, identifier)
@@ -977,12 +968,10 @@ class PlutoTV(Screen):
 				self["menu"].setCurrentIndex(0)
 				self.setTitle(f"{self.baseTitle} - {self.getTitle().split(" - ")[1]} - {name}")
 			case "series":
-				header = buildHeader(PLUTO_DATA[self.region][PLUTO_IP])
+				header = plutoAuth._apiHeaders(PLUTO_DATA[self.region][PLUTO_IP])
 				param = {
 					"includeItems": "true",
 					"deviceType": "web",
-					"deviceId": DEVICEID1_HEX,
-					"sid": SID1_HEX,
 				}
 				series = fetchURL(PLUTO_SEASON_URL % identifier, header=header, param=param)
 				# seriesDump(self.region, series)
@@ -1798,7 +1787,7 @@ class PlutoUpdater:
 					"deviceId": DEVICEID1_HEX,
 					"sid": SID1_HEX
 				}
-				header = buildHeader(PLUTO_DATA[region][PLUTO_IP])
+				header = plutoAuth._apiHeaders(PLUTO_DATA[region][PLUTO_IP])
 				channels = sorted(fetchURL(PLUTO_LINEUP_URL, header=header, param=param), key=lambda x: x["number"])
 				# channelsDump(region, channels)
 				channelCount = len(channels)
@@ -1971,7 +1960,7 @@ class PlutoUpdater:
 						"deviceId": DEVICEID1_HEX,
 						"sid": SID1_HEX,
 					}
-					header = buildHeader(PLUTO_DATA[region][PLUTO_IP])
+					header = plutoAuth._apiHeaders(PLUTO_DATA[region][PLUTO_IP])
 					# Does the list of guides data need to be sorted?
 					guides = sorted(fetchURL(PLUTO_GUIDE_URL, header=header, param=param), key=lambda x: x["number"])
 					# guidesDump(region, guides)
@@ -2214,32 +2203,6 @@ class PlutoUpdater:
 		if self.abort:
 			result = self.EXIT_ABORT
 		return result
-
-
-def updateQuery(url, queryData, safe="", quote_via=quote_plus):
-	parsed = urlparse(url)
-	query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-	for key, value in queryData.items():  # Update the URL query with the supplied queryData.
-		if value:
-			query[key] = value
-	queryList = []
-	for key in query.keys():  # Reconstruct the query string.
-		queryList.append(f"{key}={query[key]}")
-	query = quote_via("&".join(queryList), safe=f"=&{safe}")
-	return parsed._replace(query=query).geturl()
-
-
-def buildHeader(ipAddress):
-	header = {
-		"Accept": "application/json, text/javascript, */*; q=0.01",
-		"Host": "api.pluto.tv",
-		"Connection": "keep-alive",
-		"Referer": "http://pluto.tv/",
-		"Origin": "http://pluto.tv"
-	} | PLUTO_USER_AGENT
-	if ipAddress:
-		header["X-Forwarded-For"] = ipAddress
-	return header
 
 
 def fetchURL(url, param={}, header=PLUTO_USER_AGENT):
