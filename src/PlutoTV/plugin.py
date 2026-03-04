@@ -44,6 +44,12 @@ Copyright (c) 2026 jbleyel and IanSav - Version 3.0.2
 - Add debug code to allow for the discovery of new Pluto TV types, genres and ratings.
 - Correct the Samsung Live TV mode option URLs.
 
+Copyright (c) 2026 jbleyel and IanSav and WXBet - Version 3.0.3
+- Add PlutoAuth class for boot token authentication
+- Switch all API calls to PlutoAuth bearer token
+- Fix bugs: urllib3 log spam, EPG crash, unbound variable
+- Use pluto:// URI scheme for bouquet stream URLs
+
 SPDX-License-Identifier: GPL-2.0-or-later
 See LICENSES/README.md for more information.
 
