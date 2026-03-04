@@ -44,6 +44,12 @@ Copyright (c) 2026 jbleyel and IanSav - Version 3.0.2
 - Add debug code to allow for the discovery of new Pluto TV types, genres and ratings.
 - Correct the Samsung Live TV mode option URLs.
 
+Copyright (c) 2026 jbleyel and IanSav and WXBet - Version 3.0.3
+- Add PlutoAuth class for boot token authentication
+- Switch all API calls to PlutoAuth bearer token
+- Fix bugs: urllib3 log spam, EPG crash, unbound variable
+- Use pluto:// URI scheme for bouquet stream URLs
+
 SPDX-License-Identifier: GPL-2.0-or-later
 See LICENSES/README.md for more information.
 
@@ -65,13 +71,13 @@ from os import makedirs, statvfs
 from os.path import exists, getsize, isdir, isfile, join
 from pickle import dump, load
 from re import sub
-from requests import get
+from requests import get, Session
 from shutil import copy2
 from time import gmtime, localtime, sleep, strftime, strptime, time
 from traceback import format_exc
 from twisted.internet import defer, reactor, threads
 from unicodedata import normalize
-from urllib.parse import parse_qsl, quote_plus, urljoin, urlparse
+from urllib.parse import urljoin, urlparse
 from uuid import uuid4, uuid1
 
 from enigma import eDVBDB, eEPGCache, ePicLoad, eServiceCenter, eServiceReference, eTimer, gRGB, iPlayableService
@@ -108,6 +114,9 @@ from Tools.Notifications import AddNotificationWithCallback
 
 from . import _, __version__
 
+from logging import getLogger
+getLogger("urllib3").setLevel(40)  # ERROR only, suppress debug/info connection logs.
+
 MODULE_NAME = __name__.split(".")[-1]
 
 PLUTO_USER_AGENT = {"User-agent": "Mozilla/5.0 (Windows NT 6.2; rv:24.0) Gecko/20100101 Firefox/24.0"}
@@ -124,6 +133,112 @@ PLUTO_SERVICE_NUMBER_PATH = "/etc/enigma2/PlutoTV_numbers"
 
 SID1_HEX = str(uuid4().hex)  # Defined as a global to save time.
 DEVICEID1_HEX = str(uuid1().hex)  # Defined as a global to save time.
+
+
+class PlutoAuth:
+	BOOT_URL = "https://boot.pluto.tv/v4/start"
+	STITCHER_BASE = "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv"
+
+	def __init__(self):
+		self.session = Session()
+		self.client_id = str(uuid4())
+		self.cache = {}
+
+	@staticmethod
+	def _tokenExpiry(token):
+		try:
+			from json import loads
+			from base64 import urlsafe_b64decode
+			payload = token.split(".")[1]
+			padding = 4 - len(payload) % 4
+			if padding != 4:
+				payload += "=" * padding
+			return loads(urlsafe_b64decode(payload)).get("exp", 0)
+		except Exception:
+			return 0
+
+	def boot(self, ipAddress=""):
+		cacheKey = ipAddress or "default"
+		cached = self.cache.get(cacheKey)
+		if cached and time() < cached["exp"] - 60:
+			return cached["response"]
+		headers = {
+			"authority": "boot.pluto.tv",
+			"accept": "*/*",
+			"accept-language": "en-US,en;q=0.9",
+			"origin": "https://pluto.tv",
+			"referer": "https://pluto.tv/",
+			"sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+			"sec-ch-ua-mobile": "?0",
+			"sec-ch-ua-platform": '"Linux"',
+			"sec-fetch-dest": "empty",
+			"sec-fetch-mode": "cors",
+			"sec-fetch-site": "same-site",
+			"user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		}
+		params = {
+			"appName": "web",
+			"appVersion": "8.0.0-111b2b9dc00bd0bea9030b30662159ed9e7c8bc6",
+			"deviceVersion": "122.0.0",
+			"deviceModel": "web",
+			"deviceMake": "chrome",
+			"deviceType": "web",
+			"clientID": self.client_id,
+			"clientModelNumber": "1.0.0",
+			"serverSideAds": "false",
+			"drmCapabilities": "widevine:L3",
+			"blockingMode": "",
+		}
+		if ipAddress:
+			headers["X-Forwarded-For"] = ipAddress
+		try:
+			response = self.session.get(self.BOOT_URL, headers=headers, params=params, timeout=10)
+			response.raise_for_status()
+			resp = response.json()
+			token = resp.get("sessionToken", "")
+			exp = self._tokenExpiry(token)
+			self.cache[cacheKey] = {"response": resp, "exp": exp}
+			print(f"[PlutoTV] New token for {cacheKey}, expires {exp}")
+			return resp
+		except Exception as e:
+			print(f"[PlutoTV] boot error: {e}")
+			return {}
+
+	def _apiHeaders(self, ipAddress=""):
+		token = self.boot(ipAddress).get("sessionToken", "")
+		headers = {
+			"accept": "application/json, text/javascript, */*; q=0.01",
+			"authorization": f"Bearer {token}",
+			"origin": "https://pluto.tv",
+			"referer": "https://pluto.tv/",
+			"user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+		}
+		if ipAddress:
+			headers["X-Forwarded-For"] = ipAddress
+		return headers
+
+	def buildStreamURL(self, channel_id, ipAddress=""):
+		boot_resp = self.boot(ipAddress)
+		token = boot_resp.get("sessionToken", "")
+		return (
+			f"{self.STITCHER_BASE}/v2/stitch/hls/channel/{channel_id}/master.m3u8"
+			f"?jwt={token}&masterJWTPassthrough=true"
+		)
+
+	def buildVodStreamURL(self, vod_url, ipAddress=""):
+		boot_resp = self.boot(ipAddress)
+		token = boot_resp.get("sessionToken", "")
+		path = vod_url.split("?")[0]
+		path = sub(r"^https?://[^/]+", "", path)
+		if path.startswith("/stitch/"):
+			path = "/v2" + path
+		return (
+			f"{self.STITCHER_BASE}{path}"
+			f"?jwt={token}&masterJWTPassthrough=true"
+		)
+
+
+plutoAuth = PlutoAuth()
 
 PLUTO_COUNTRY_NAME = 0
 PLUTO_IP = 1
@@ -153,11 +268,6 @@ config.plugins.PlutoTV.omitPromotions = ConfigYesNo(default=False)
 config.plugins.PlutoTV.channelNumbering = ConfigSelection(default="original", choices=[
 	("original", _("Original")),
 	("plugin", _("Plugin generated"))
-])
-config.plugins.PlutoTV.liveMode = ConfigSelection(default="samsung", choices=[
-	("original", _("Original")),
-	("roku", "Roku TV"),
-	("samsung", "Samsung TV")
 ])
 domData = fileReadXML(resolveFilename(SCOPE_PLUGIN_ABSOLUTE, "plutotv.xml"), default=None, source=MODULE_NAME)
 choices = []
@@ -474,12 +584,10 @@ class PlutoTV(Screen):
 			self.favorites[self.region] = {}
 		self.categories[self.FAVORITES_NAME] = [self.favorites[self.region][x] for x in self.favorites[self.region].keys()]  # It is assumed that the favorites category item is *always* first!
 		self.categoryMenu.append((self.FAVORITES_NAME, self.FAVORITES_NAME, len(self.favorites[self.region])))  # It is assumed that the favorites menu item is *always* first!
-		header = buildHeader(PLUTO_DATA[self.region][PLUTO_IP])
+		header = plutoAuth._apiHeaders(PLUTO_DATA[self.region][PLUTO_IP])
 		param = {
 			"includeItems": "true",
 			"deviceType": "web",
-			"deviceId": DEVICEID1_HEX,
-			"sid": SID1_HEX,
 		}
 		carousel = fetchURL(PLUTO_VOD_URL, header=header, param=param)  # A single dictionary.
 		# carouselDump(self.region, carousel)
@@ -823,14 +931,7 @@ class PlutoTV(Screen):
 
 	def keySelect(self):
 		def playVOD(url, name, identifier):
-			url = updateQuery(url, {
-				"deviceId": DEVICEID1_HEX,
-				"sid": DEVICEID1_HEX,
-				"deviceType": "web",
-				"deviceMake": "Firefox",
-				"deviceModel": "Firefox",
-				"appName": "web"
-			})
+			url = plutoAuth.buildVodStreamURL(url, PLUTO_DATA[self.region][PLUTO_IP])
 			serviceReference = eServiceReference(f"4097:0:0:0:0:0:0:0:0:0:{url.replace(":", "%3A")}:{name.replace(":", "%3A")}")
 			if "m3u8" in url.lower():
 				self.session.open(PlutoPlayer, serviceReference, identifier)
@@ -871,12 +972,10 @@ class PlutoTV(Screen):
 				self["menu"].setCurrentIndex(0)
 				self.setTitle(f"{self.baseTitle} - {self.getTitle().split(" - ")[1]} - {name}")
 			case "series":
-				header = buildHeader(PLUTO_DATA[self.region][PLUTO_IP])
+				header = plutoAuth._apiHeaders(PLUTO_DATA[self.region][PLUTO_IP])
 				param = {
 					"includeItems": "true",
 					"deviceType": "web",
-					"deviceId": DEVICEID1_HEX,
-					"sid": SID1_HEX,
 				}
 				series = fetchURL(PLUTO_SEASON_URL % identifier, header=header, param=param)
 				# seriesDump(self.region, series)
@@ -1661,14 +1760,12 @@ class PlutoUpdater:
 		addXiaomi = config.plugins.PlutoTV.addXiaomi.value
 		if not addXiaomi:
 			print("[PlutoTV] Xiaomi TV categories will not being added.")
-		self.liveMode = config.plugins.PlutoTV.liveMode.value
 		self.channelNumbering = config.plugins.PlutoTV.channelNumbering.value
 		self.piconMode = config.plugins.PlutoTV.piconMode.value
 		# print(f"[PlutoTV] DEBUG: bouquetRegionList={bouquetRegionList}.")
 		# print(f"[PlutoTV] DEBUG: serviceTypes={serviceTypes}.")
 		# print(f"[PlutoTV] DEBUG: addSamsung={addSamsung}.")
 		# print(f"[PlutoTV] DEBUG: addXiaomi={addXiaomi}.")
-		# print(f"[PlutoTV] DEBUG: self.liveMode='{self.liveMode}'.")
 		# print(f"[PlutoTV] DEBUG: self.channelNumbering='{self.channelNumbering}'.")
 		# print(f"[PlutoTV] DEBUG: self.piconMode='{self.piconMode}'.")
 		try:
@@ -1692,7 +1789,7 @@ class PlutoUpdater:
 					"deviceId": DEVICEID1_HEX,
 					"sid": SID1_HEX
 				}
-				header = buildHeader(PLUTO_DATA[region][PLUTO_IP])
+				header = plutoAuth._apiHeaders(PLUTO_DATA[region][PLUTO_IP])
 				channels = sorted(fetchURL(PLUTO_LINEUP_URL, header=header, param=param), key=lambda x: x["number"])
 				# channelsDump(region, channels)
 				channelCount = len(channels)
@@ -1739,36 +1836,8 @@ class PlutoUpdater:
 						print("[PlutoTV] Categories without URLs are not being added.")
 						continue
 					identifier = channel["_id"]
-					match self.liveMode:
-						case "original":
-							url = [updateQuery(x["url"], {
-								"deviceType": "web",
-								"deviceMake": "Chrome",
-								"deviceModel": "web",
-								"appName": "web",
-								"deviceId": "bc83a564-4b91-11ef-8a44-83c5e90e038f"
-							}) for x in urls if x["type"].lower() == "hls"][0]
-						case "roku":
-							url = "&".join((
-								f"https://stitcher-ipv4.pluto.tv/v1/stitch/embed/hls/channel/{identifier}/master.m3u8?deviceId=PSID",
-								"deviceModel=web",
-								"deviceVersion=1.0",
-								"appVersion=1.0",
-								"deviceType=rokuChannel",
-								"deviceMake=rokuChannel",
-								"deviceDNT=1"
-							))
-						case "samsung":
-							url = "&".join((
-								f"https://stitcher-ipv4.pluto.tv/v1/stitch/embed/hls/channel/{identifier}/master.m3u8?deviceType=samsung-tvplus",
-								"deviceMake=samsung",
-								"deviceModel=samsung",
-								"deviceVersion=DNT",
-								"appVersion=DNT",
-								"deviceDNT=0",
-								"deviceId=1",
-								"sid=01"
-							))
+					ipAddress = PLUTO_DATA[region][PLUTO_IP]
+					url = f"pluto://{identifier}?ip={ipAddress}" if ipAddress else f"pluto://{identifier}"
 					if category not in channelList.keys():
 						categories.append(category)
 						channelList[category] = []
@@ -1865,7 +1934,7 @@ class PlutoUpdater:
 						"deviceId": DEVICEID1_HEX,
 						"sid": SID1_HEX,
 					}
-					header = buildHeader(PLUTO_DATA[region][PLUTO_IP])
+					header = plutoAuth._apiHeaders(PLUTO_DATA[region][PLUTO_IP])
 					# Does the list of guides data need to be sorted?
 					guides = sorted(fetchURL(PLUTO_GUIDE_URL, header=header, param=param), key=lambda x: x["number"])
 					# guidesDump(region, guides)
@@ -1978,11 +2047,13 @@ class PlutoUpdater:
 							subGenre = episode.get("subGenre", "")
 							extended = f"{extended}\n\n{_("Rating")}: {rating}{descriptors}\n{_("Genre")}: {genre} - {subGenre}"
 							eventType = self.PLUTO_SUB_GENRES.get(subGenre, 0x00)
-							localRegion = international.getCountryAlpha3()
-							plutoRegion = international.getCountryAlpha3(region)
+							localRegion = international.getCountryAlpha3() or ""
+							plutoRegion = international.getCountryAlpha3(region) or ""
 							ratingCode = decodeRating(region, rating)
-							ratingList = [(plutoRegion, ratingCode)]
-							if localRegion != plutoRegion:
+							ratingList = []
+							if plutoRegion and len(plutoRegion) == 3:
+								ratingList.append((plutoRegion, ratingCode))
+							if localRegion and len(localRegion) == 3 and localRegion != plutoRegion:
 								ratingList.insert(0, (localRegion, ratingCode))
 							# StartTime [long], Duration [int], EventTitle, ShortDescription, ExtendedDescription, EventType [byte], EventID [int], ParentalRatings [list of tuples (Country [3 letter string], ParentalRating [byte])]
 							guideList[identifier].append((start, duration, title, short, extended, eventType, 0, ratingList))
@@ -2097,8 +2168,6 @@ class PlutoUpdater:
 			debugLog.append(f"Sub genres={subGenres}")
 		if ratings:
 			debugLog.append(f"Ratings={ratings}")
-		if ratingDescriptors:
-			debugLog.append(f"Rating descriptors={ratingDescriptors}")
 		if debugLog:
 			debugLog.insert(0, "Pluto TV Debug Log - Missing Definitions")
 			fileWriteLines("/tmp/plutotv_missing.txt", debugLog, source=MODULE_NAME)
@@ -2108,32 +2177,6 @@ class PlutoUpdater:
 		if self.abort:
 			result = self.EXIT_ABORT
 		return result
-
-
-def updateQuery(url, queryData, safe="", quote_via=quote_plus):
-	parsed = urlparse(url)
-	query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-	for key, value in queryData.items():  # Update the URL query with the supplied queryData.
-		if value:
-			query[key] = value
-	queryList = []
-	for key in query.keys():  # Reconstruct the query string.
-		queryList.append(f"{key}={query[key]}")
-	query = quote_via("&".join(queryList), safe=f"=&{safe}")
-	return parsed._replace(query=query).geturl()
-
-
-def buildHeader(ipAddress):
-	header = {
-		"Accept": "application/json, text/javascript, */*; q=0.01",
-		"Host": "api.pluto.tv",
-		"Connection": "keep-alive",
-		"Referer": "http://pluto.tv/",
-		"Origin": "http://pluto.tv"
-	} | PLUTO_USER_AGENT
-	if ipAddress:
-		header["X-Forwarded-For"] = ipAddress
-	return header
 
 
 def fetchURL(url, param={}, header=PLUTO_USER_AGENT):
@@ -2620,12 +2663,41 @@ def autoStart(reason, session):
 		plutoScheduler.stop()
 
 
+PLUTO_SCHEMA = "pluto%3a//"
+PLUTO_SCHEMA_UPPER = "pluto%3A//"
+
+
+def playService(service, **kwargs):
+	errormsg = None
+	sRef = service.toString() if service else ""
+	if PLUTO_SCHEMA in sRef or PLUTO_SCHEMA_UPPER in sRef:
+		parts = sRef.split(":")
+		if len(parts) > 9:
+			path = parts[10]
+			if path.startswith(PLUTO_SCHEMA) or path.startswith(PLUTO_SCHEMA_UPPER):
+				path = path[len(PLUTO_SCHEMA):]
+				path = path.replace("%3a", ":").replace("%3A", ":")
+				channelId = path.split("?")[0]
+				ipAddress = ""
+				if "?ip=" in path:
+					ipAddress = path.split("?ip=")[1].split("&")[0]
+				streamUrl = plutoAuth.buildStreamURL(channelId, ipAddress)
+				if streamUrl:
+					print(f"[PlutoTV] playService: {channelId} -> resolved")
+					return (streamUrl, errormsg)
+				else:
+					errormsg = "Failed to get Pluto TV stream token"
+					print(f"[PlutoTV] playService: {channelId} -> failed")
+	return (None, errormsg)
+
+
 def Plugins(**kwargs):
 	name = _("Pluto TV")
 	description = _("Play Pluto TV videos and create Pluto TV bouquets.  (Version: %s)") % __version__
 	plugin = [
 		PluginDescriptor(name=_("Pluto TV Scheduler"), where=[PluginDescriptor.WHERE_SESSIONSTART], fnc=autoStart),
 		PluginDescriptor(name=name, description=description, where=[PluginDescriptor.WHERE_PLUGINMENU], icon="plutotv.png", fnc=runPlutoTV),
+		PluginDescriptor(name="PlutoTV", description="Resolve pluto:// URIs", where=PluginDescriptor.WHERE_PLAYSERVICE, needsRestart=False, fnc=playService),
 	]
 	if config.plugins.PlutoTV.addToMainMenu.value:
 		# plugin.append(PluginDescriptor(name=name, description=description, where=[PluginDescriptor.WHERE_MAINMENU], icon="plutotv.png", fnc=runPlutoTV))

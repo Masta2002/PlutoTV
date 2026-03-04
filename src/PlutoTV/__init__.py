@@ -6,7 +6,7 @@ from Tools.Directories import SCOPE_PLUGINS, resolveFilename
 PluginLanguageDomain = "PlutoTV"
 PluginLanguagePath = "Extensions/PlutoTV/locale"
 
-__version__ = "3.0.2"
+__version__ = "3.0.3"
 
 
 def localeInit():

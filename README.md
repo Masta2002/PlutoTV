@@ -13,6 +13,14 @@ This plugin was developed with a lot of 💞 for the Enigma2 community. You are 
 <summary>Click to show Relases Notes.</summary> 
 
 # Relases Notes:
+**V3.0.3 - 04.03.2026**
+**Refactor API calls**
+- Add PlutoAuth class for boot token authentication
+- Switch all API calls to PlutoAuth bearer token
+- Fix bugs: urllib3 log spam, EPG crash, unbound variable
+- Use pluto:// URI scheme for bouquet stream URLs
+
+
 **V3.0.2 - 26.01.2026**
 **Small correction and improvements**
 - Make Components/International.py no longer optional.
